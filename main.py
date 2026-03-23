@@ -1,12 +1,18 @@
 import json
 import subprocess
 
+from colorama import Fore, Style, init
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
+init(autoreset=True)
+
 client = OpenAI()
 
-messages: list[ChatCompletionMessageParam] = []
+messages: list[ChatCompletionMessageParam] = [
+    {"role": "system", "content":
+     "You are an expert coding agent that codes using the command line. You can use any Linux commands that make sense. If you execute a command the results will be given to you after the command completes."}
+]
 
 tools: list[ChatCompletionToolParam] = [
     {
@@ -31,6 +37,8 @@ tools: list[ChatCompletionToolParam] = [
 
 
 def execute_bash(command):
+    print(f"{Fore.CYAN}[bash] command{Style.RESET_ALL}: {command}")
+
     try:
         result = subprocess.run(
             command,
@@ -40,6 +48,7 @@ def execute_bash(command):
             timeout=30,
         )
     except subprocess.TimeoutExpired:
+        print(f"{Fore.RED}[bash] stderr{Style.RESET_ALL}: Command timed out after 30 seconds.")
         return json.dumps(
             {
                 "command": command,
@@ -49,12 +58,18 @@ def execute_bash(command):
             }
         )
 
+    stdout_text = result.stdout or "<empty>"
+    stderr_text = result.stderr or "<empty>"
+
+    print(f"{Fore.GREEN}[bash] stdout{Style.RESET_ALL}: {stdout_text}")
+    print(f"{Fore.RED}[bash] stderr{Style.RESET_ALL}: {stderr_text}")
+
     return json.dumps(
         {
             "command": command,
             "returncode": result.returncode,
-            "stdout": result.stdout[-4000:],
-            "stderr": result.stderr[-4000:],
+            "stdout": result.stdout,
+            "stderr": result.stderr,
         }
     )
 

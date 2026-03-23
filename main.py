@@ -37,7 +37,20 @@ tools: list[ChatCompletionToolParam] = [
 
 
 def execute_bash(command):
-    print(f"{Fore.CYAN}[bash] command{Style.RESET_ALL}: {command}")
+    display_command = command.replace("\x00", "\\x00")
+    print(f"{Fore.CYAN}[bash] command{Style.RESET_ALL}: {display_command}")
+
+    if "\x00" in command:
+        error_message = "Command contains an embedded null byte and was not executed."
+        print(f"{Fore.RED}[bash] stderr{Style.RESET_ALL}: {error_message}")
+        return json.dumps(
+            {
+                "command": display_command,
+                "returncode": None,
+                "stdout": "",
+                "stderr": error_message,
+            }
+        )
 
     try:
         result = subprocess.run(
@@ -51,10 +64,21 @@ def execute_bash(command):
         print(f"{Fore.RED}[bash] stderr{Style.RESET_ALL}: Command timed out after 30 seconds.")
         return json.dumps(
             {
-                "command": command,
+                "command": display_command,
                 "returncode": None,
                 "stdout": "",
                 "stderr": "Command timed out after 30 seconds.",
+            }
+        )
+    except (OSError, ValueError) as exc:
+        error_message = str(exc)
+        print(f"{Fore.RED}[bash] stderr{Style.RESET_ALL}: {error_message}")
+        return json.dumps(
+            {
+                "command": display_command,
+                "returncode": None,
+                "stdout": "",
+                "stderr": error_message,
             }
         )
 
@@ -66,7 +90,7 @@ def execute_bash(command):
 
     return json.dumps(
         {
-            "command": command,
+            "command": display_command,
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,

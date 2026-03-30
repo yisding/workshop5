@@ -202,13 +202,13 @@ class Agent:
         model: str,
         system_prompt: str,
         tools: Sequence[ChatCompletionToolParam],
+        messages: list[ChatCompletionMessageParam] | None = None,
     ) -> None:
         self.name = name
         self.model = model
+        self.system_prompt = system_prompt
         self.tools = list(tools)
-        self.messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system_prompt}
-        ]
+        self.messages = messages if messages is not None else []
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], str]] = {}
 
     def register_tool_handler(
@@ -223,9 +223,14 @@ class Agent:
         print_agent_status(self.name, "RUNNING", f"{Back.BLUE}{Fore.WHITE}")
 
         while True:
+            system_message: ChatCompletionMessageParam = {
+                "role": "system",
+                "content": self.system_prompt,
+            }
+            messages_with_system = [system_message] + self.messages
             response = client.chat.completions.create(
                 model=self.model,
-                messages=self.messages,
+                messages=messages_with_system,
                 tools=self.tools,
             )
 
@@ -455,8 +460,122 @@ class CodeExplorationAgent(Agent):
         )
 
 
+class PlanningAgent(Agent):
+    def __init__(
+        self,
+        explorer: "CodeExplorationAgent",
+        messages: list[ChatCompletionMessageParam] | None = None,
+    ) -> None:
+        self.explorer = explorer
+
+        tools = cast(
+            list[ChatCompletionToolParam],
+            [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute a shell command and return its output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The shell command to execute.",
+                            }
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "think",
+                    "description": "Record a thought for the user to see before continuing.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thought": {
+                                "type": "string",
+                                "description": "The thought to display to the user.",
+                            }
+                        },
+                        "required": ["thought"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "explore",
+                    "description": "Delegate read-only code exploration to a dedicated subagent.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "What the subagent should investigate.",
+                            }
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ],
+        )
+
+        super().__init__(
+            name="planning_agent",
+            model="gpt-5.2",
+            system_prompt=(
+                "You are a planning agent. Generate detailed bullet-point plans for coding tasks. "
+                "Use bash and explore tools to investigate the codebase, then produce a comprehensive, "
+                "step-by-step plan without modifying any files. Focus on clarity and actionability."
+            ),
+            tools=tools,
+            messages=messages,
+        )
+
+        self.register_tool_handler("bash", self._handle_bash)
+        self.register_tool_handler("think", self._handle_think)
+        self.register_tool_handler("explore", self._handle_explore)
+
+    @staticmethod
+    def _handle_bash(arguments: dict[str, Any]) -> str:
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            raise ToolExecutionError("bash requires a string command argument.")
+        return tool_bash(command)
+
+    @staticmethod
+    def _handle_think(arguments: dict[str, Any]) -> str:
+        thought = arguments.get("thought")
+        if not isinstance(thought, str):
+            raise ToolExecutionError("think requires a string thought argument.")
+        return tool_think(thought)
+
+    def _handle_explore(self, arguments: dict[str, Any]) -> str:
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str):
+            raise ToolExecutionError("explore requires a string prompt argument.")
+
+        print_tool_line(Fore.CYAN, "explore", "prompt", prompt)
+        exploration_reply = self.explorer.ask(prompt)
+        print_tool_line(Fore.GREEN, "explore", "result", exploration_reply)
+
+        return json.dumps({"prompt": prompt, "result": exploration_reply})
+
+
 class CodingAgent(Agent):
-    def __init__(self, explorer: CodeExplorationAgent) -> None:
+    def __init__(
+        self,
+        explorer: CodeExplorationAgent,
+        messages: list[ChatCompletionMessageParam] | None = None,
+    ) -> None:
         self.explorer = explorer
 
         tools = cast(
@@ -569,6 +688,7 @@ class CodingAgent(Agent):
                 " follow up with 'explore: summarize the main loop in src/main.py' or 'explore: what does the tests/ directory contain?'"
             ),
             tools=tools,
+            messages=messages,
         )
 
         self.register_tool_handler("bash", self._handle_bash)
@@ -611,13 +731,18 @@ class CodingAgent(Agent):
 
 def main() -> None:
     explorer = CodeExplorationAgent()
-    coding_agent = CodingAgent(explorer=explorer)
+    shared_messages: list[ChatCompletionMessageParam] = []
+    coding_agent = CodingAgent(explorer=explorer, messages=shared_messages)
+    planning_agent = PlanningAgent(explorer=explorer, messages=shared_messages)
 
+    current_agent = coding_agent
     print("Chat started. Type 'exit' or 'quit' to stop.")
+    print("Use '/plan' to switch to the planning agent or '/code' to switch to the coding agent.")
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            agent_label = f"[{current_agent.name}]" if current_agent else "[chat]"
+            user_input = input(f"You {agent_label}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
@@ -629,7 +754,17 @@ def main() -> None:
             print("Goodbye!")
             break
 
-        assistant_reply = coding_agent.ask(user_input)
+        if user_input.lower() == "/plan":
+            current_agent = planning_agent
+            print(f"\n{Style.BRIGHT}{Back.MAGENTA}{Fore.WHITE}Switched to planning agent{Style.RESET_ALL}\n")
+            continue
+
+        if user_input.lower() == "/code":
+            current_agent = coding_agent
+            print(f"\n{Style.BRIGHT}{Back.CYAN}{Fore.BLACK}Switched to coding agent{Style.RESET_ALL}\n")
+            continue
+
+        assistant_reply = current_agent.ask(user_input)
         print(f"Assistant: {assistant_reply}")
 
 

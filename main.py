@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 
-from colorama import Fore, Style, init
+from colorama import Back, Fore, Style, init
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
@@ -19,6 +19,16 @@ class ToolExecutionError(Exception):
 
 def print_tool_line(color: str, tool_name: str, label: str, value: str) -> None:
     print(f"{color}[{tool_name}] {label}{Style.RESET_ALL}: {value}")
+
+
+def print_agent_status(agent_name: str, status: str, color: str) -> None:
+    banner = f"[{agent_name}] {status}"
+    print(f"{Style.BRIGHT}{color}{banner}{Style.RESET_ALL}")
+
+
+def print_tool_call(agent_name: str, tool_name: str) -> None:
+    banner = f"[{agent_name}] TOOL CALL -> {tool_name}"
+    print(f"{Style.BRIGHT}{Back.WHITE}{Fore.BLACK}{banner}{Style.RESET_ALL}")
 
 
 def tool_bash(command: str) -> str:
@@ -210,6 +220,7 @@ class Agent:
 
     def ask(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
+        print_agent_status(self.name, "RUNNING", f"{Back.BLUE}{Fore.WHITE}")
 
         while True:
             response = client.chat.completions.create(
@@ -222,6 +233,7 @@ class Agent:
             if not message.tool_calls:
                 assistant_reply = message.content or ""
                 self.messages.append({"role": "assistant", "content": assistant_reply})
+                print_agent_status(self.name, "COMPLETED", f"{Back.GREEN}{Fore.BLACK}")
                 return assistant_reply
 
             function_tool_calls = [
@@ -262,6 +274,7 @@ class Agent:
                 )
 
     def _execute_tool_call(self, tool_name: str, raw_arguments: str) -> str:
+        print_tool_call(self.name, tool_name)
         handler = self._tool_handlers.get(tool_name)
         if handler is None:
             return json.dumps({"error": f"Unsupported tool: {tool_name}"})

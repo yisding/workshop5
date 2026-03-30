@@ -1,7 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence, cast
 
 from colorama import Fore, Style, init
 from openai import OpenAI
@@ -12,95 +12,85 @@ init(autoreset=True)
 client = OpenAI()
 workspace_root = Path(__file__).resolve().parent
 
-messages: list[ChatCompletionMessageParam] = [
-    {"role": "system", "content":
-     "You are an expert coding agent that codes using the command line. You can use Linux commands that make sense. You also have a think tool for visible reasoning and an apply_patch tool for updating files with diffs. If you execute a tool, the results will be given to you after the tool completes."}
-]
 
-tools: list[ChatCompletionToolParam] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Execute a shell command and return its output.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute.",
-                    }
-                },
-                "required": ["command"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "think",
-            "description": "Record a thought for the user to see before continuing.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "The thought to display to the user.",
-                    }
-                },
-                "required": ["thought"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_patch",
-            "description": "Apply a Linux patch-compatible diff to a file in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "object",
-                        "properties": {
-                            "type": {
-                                "type": "string",
-                                "enum": ["update_file"],
-                                "description": "The patch operation type.",
-                            },
-                            "diff": {
-                                "type": "string",
-                                "description": "A diff string that can be applied by the Linux patch command.",
-                            },
-                            "path": {
-                                "type": "string",
-                                "description": "The workspace-relative path to update.",
-                            },
-                        },
-                        "required": ["type", "diff", "path"],
-                        "additionalProperties": False,
-                    }
-                },
-                "required": ["operation"],
-                "additionalProperties": False,
-            },
-        },
-    }
-]
+class ToolExecutionError(Exception):
+    """Raised when a tool invocation is invalid or cannot be completed."""
 
 
 def print_tool_line(color: str, tool_name: str, label: str, value: str) -> None:
     print(f"{color}[{tool_name}] {label}{Style.RESET_ALL}: {value}")
 
 
-def execute_think(thought: str) -> str:
+def tool_bash(command: str) -> str:
+    display_command = command.replace("\x00", "\\x00")
+    print_tool_line(Fore.CYAN, "bash", "command", display_command)
+
+    if "\x00" in command:
+        error_message = "Command contains an embedded null byte and was not executed."
+        print_tool_line(Fore.RED, "bash", "stderr", error_message)
+        return json.dumps(
+            {
+                "command": display_command,
+                "returncode": None,
+                "stdout": "",
+                "stderr": error_message,
+            }
+        )
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=workspace_root,
+        )
+    except subprocess.TimeoutExpired:
+        error_message = "Command timed out after 30 seconds."
+        print_tool_line(Fore.RED, "bash", "stderr", error_message)
+        return json.dumps(
+            {
+                "command": display_command,
+                "returncode": None,
+                "stdout": "",
+                "stderr": error_message,
+            }
+        )
+    except (OSError, ValueError) as exc:
+        error_message = str(exc)
+        print_tool_line(Fore.RED, "bash", "stderr", error_message)
+        return json.dumps(
+            {
+                "command": display_command,
+                "returncode": None,
+                "stdout": "",
+                "stderr": error_message,
+            }
+        )
+
+    stdout_text = result.stdout or "<empty>"
+    stderr_text = result.stderr or "<empty>"
+
+    print_tool_line(Fore.GREEN, "bash", "stdout", stdout_text)
+    print_tool_line(Fore.RED, "bash", "stderr", stderr_text)
+
+    return json.dumps(
+        {
+            "command": display_command,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+
+
+def tool_think(thought: str) -> str:
     print_tool_line(Fore.MAGENTA, "think", "thought", thought)
     return json.dumps({"thought": thought})
 
 
-def execute_apply_patch(operation: dict[str, Any]) -> str:
+def tool_apply_patch(operation: dict[str, Any]) -> str:
     operation_type = operation.get("type")
     path = operation.get("path")
     diff = operation.get("diff")
@@ -125,10 +115,9 @@ def execute_apply_patch(operation: dict[str, Any]) -> str:
         return json.dumps({"error": error_message})
 
     try:
-        target_path = (workspace_root / path).resolve()
-        target_path.relative_to(workspace_root)
-    except ValueError:
-        error_message = "Patch path must stay within the workspace."
+        target_path = resolve_workspace_path(path)
+    except ToolExecutionError as exc:
+        error_message = str(exc)
         print_tool_line(Fore.RED, "apply_patch", "stderr", error_message)
         return json.dumps({"error": error_message})
 
@@ -173,12 +162,11 @@ def execute_apply_patch(operation: dict[str, Any]) -> str:
             }
         )
 
-    success_message = f"Updated {path}"
     return json.dumps(
         {
             "status": "ok",
             "path": path,
-            "message": success_message,
+            "message": f"Updated {path}",
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -186,169 +174,451 @@ def execute_apply_patch(operation: dict[str, Any]) -> str:
     )
 
 
-def execute_bash(command: str) -> str:
-    display_command = command.replace("\x00", "\\x00")
-    print_tool_line(Fore.CYAN, "bash", "command", display_command)
-
-    if "\x00" in command:
-        error_message = "Command contains an embedded null byte and was not executed."
-        print_tool_line(Fore.RED, "bash", "stderr", error_message)
-        return json.dumps(
-            {
-                "command": display_command,
-                "returncode": None,
-                "stdout": "",
-                "stderr": error_message,
-            }
-        )
-
+def resolve_workspace_path(path: str) -> Path:
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        print_tool_line(Fore.RED, "bash", "stderr", "Command timed out after 30 seconds.")
-        return json.dumps(
-            {
-                "command": display_command,
-                "returncode": None,
-                "stdout": "",
-                "stderr": "Command timed out after 30 seconds.",
-            }
-        )
-    except (OSError, ValueError) as exc:
-        error_message = str(exc)
-        print_tool_line(Fore.RED, "bash", "stderr", error_message)
-        return json.dumps(
-            {
-                "command": display_command,
-                "returncode": None,
-                "stdout": "",
-                "stderr": error_message,
-            }
-        )
+        resolved_path = (workspace_root / path).resolve()
+        resolved_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise ToolExecutionError("Path must stay within the workspace.") from exc
 
-    stdout_text = result.stdout or "<empty>"
-    stderr_text = result.stderr or "<empty>"
-
-    print_tool_line(Fore.GREEN, "bash", "stdout", stdout_text)
-    print_tool_line(Fore.RED, "bash", "stderr", stderr_text)
-
-    return json.dumps(
-        {
-            "command": display_command,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-    )
+    return resolved_path
 
 
-def run_model_turn():
-    while True:
-        response = client.chat.completions.create(
-            model="gpt-5.2",
-            messages=messages,
-            tools=tools,
-        )
-
-        message = response.choices[0].message
-
-        if not message.tool_calls:
-            assistant_reply = message.content or ""
-            print(f"Assistant: {assistant_reply}")
-            messages.append({"role": "assistant", "content": assistant_reply})
-            return
-
-        function_tool_calls = [
-            tool_call for tool_call in message.tool_calls if tool_call.type == "function"
+class Agent:
+    def __init__(
+        self,
+        *,
+        name: str,
+        model: str,
+        system_prompt: str,
+        tools: Sequence[ChatCompletionToolParam],
+    ) -> None:
+        self.name = name
+        self.model = model
+        self.tools = list(tools)
+        self.messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": system_prompt}
         ]
+        self._tool_handlers: dict[str, Callable[[dict[str, Any]], str]] = {}
 
-        messages.append(
-            {
-                "role": "assistant",
-                "content": message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tool_call.id,
-                        "type": tool_call.type,
-                        "function": {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments,
-                        },
-                    }
-                    for tool_call in function_tool_calls
-                ],
-            }
-        )
+    def register_tool_handler(
+        self,
+        tool_name: str,
+        handler: Callable[[dict[str, Any]], str],
+    ) -> None:
+        self._tool_handlers[tool_name] = handler
 
-        for tool_call in function_tool_calls:
-            if tool_call.function.name != "bash":
-                tool_output = json.dumps(
-                    {"error": f"Unsupported tool: {tool_call.function.name}"}
-                )
-            else:
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as exc:
-                    tool_output = json.dumps({"error": f"Invalid tool arguments: {exc}"})
-                else:
-                    if tool_call.function.name == "bash":
-                        command = arguments.get("command")
-                        if not isinstance(command, str):
-                            tool_output = json.dumps(
-                                {"error": "bash requires a string command argument."}
-                            )
-                        else:
-                            tool_output = execute_bash(command)
-                    elif tool_call.function.name == "think":
-                        thought = arguments.get("thought")
-                        if not isinstance(thought, str):
-                            tool_output = json.dumps(
-                                {"error": "think requires a string thought argument."}
-                            )
-                        else:
-                            tool_output = execute_think(thought)
-                    elif tool_call.function.name == "apply_patch":
-                        operation = arguments.get("operation")
-                        if not isinstance(operation, dict):
-                            tool_output = json.dumps(
-                                {"error": "apply_patch requires an operation object."}
-                            )
-                        else:
-                            tool_output = execute_apply_patch(operation)
-                    else:
-                        tool_output = json.dumps(
-                            {"error": f"Unsupported tool: {tool_call.function.name}"}
-                        )
+    def ask(self, user_input: str) -> str:
+        self.messages.append({"role": "user", "content": user_input})
 
-            messages.append(
+        while True:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                tools=self.tools,
+            )
+
+            message = response.choices[0].message
+            if not message.tool_calls:
+                assistant_reply = message.content or ""
+                self.messages.append({"role": "assistant", "content": assistant_reply})
+                return assistant_reply
+
+            function_tool_calls = [
+                tool_call
+                for tool_call in message.tool_calls
+                if tool_call.type == "function"
+            ]
+
+            self.messages.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output,
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": tool_call.type,
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        for tool_call in function_tool_calls
+                    ],
                 }
             )
 
-print("Chat started. Type 'exit' or 'quit' to stop.")
+            for tool_call in function_tool_calls:
+                tool_output = self._execute_tool_call(
+                    tool_call.function.name,
+                    tool_call.function.arguments,
+                )
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_output,
+                    }
+                )
 
-while True:
-    try:
-        user_input = input("You: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nGoodbye!")
-        break
+    def _execute_tool_call(self, tool_name: str, raw_arguments: str) -> str:
+        handler = self._tool_handlers.get(tool_name)
+        if handler is None:
+            return json.dumps({"error": f"Unsupported tool: {tool_name}"})
 
-    if not user_input:
-        continue
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"error": f"Invalid tool arguments: {exc}"})
 
-    if user_input.lower() in {"exit", "quit"}:
-        print("Goodbye!")
-        break
+        if not isinstance(arguments, dict):
+            return json.dumps({"error": "Tool arguments must be a JSON object."})
 
-    messages.append({"role": "user", "content": user_input})
-    run_model_turn()
+        try:
+            return handler(arguments)
+        except ToolExecutionError as exc:
+            return json.dumps({"error": str(exc)})
+        except Exception as exc:  # defensive fallback
+            return json.dumps({"error": f"Tool execution failed: {exc}"})
+
+
+class CodeExplorationAgent(Agent):
+    def __init__(self) -> None:
+        tools = cast(
+            list[ChatCompletionToolParam],
+            [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute a shell command and return its output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The shell command to execute.",
+                            }
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "think",
+                    "description": "Record a thought for the user to see before continuing.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thought": {
+                                "type": "string",
+                                "description": "The thought to display to the user.",
+                            }
+                        },
+                        "required": ["thought"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "summarize",
+                    "description": "Summarize a file in the workspace using a separate LLM call.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative path to the file.",
+                            },
+                            "focus": {
+                                "type": "string",
+                                "description": "Optional focus area for the summary.",
+                            },
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ],
+        )
+
+        super().__init__(
+            name="code_explorer",
+            model="gpt-5.2",
+            system_prompt=(
+                "You are a code exploration subagent. Perform read-only investigation, "
+                "run shell commands as needed, and summarize files clearly. "
+                "Do not attempt to modify files."
+            ),
+            tools=tools,
+        )
+
+        self.register_tool_handler("bash", self._handle_bash)
+        self.register_tool_handler("think", self._handle_think)
+        self.register_tool_handler("summarize", self._handle_summarize)
+
+    @staticmethod
+    def _handle_bash(arguments: dict[str, Any]) -> str:
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            raise ToolExecutionError("bash requires a string command argument.")
+        return tool_bash(command)
+
+    @staticmethod
+    def _handle_think(arguments: dict[str, Any]) -> str:
+        thought = arguments.get("thought")
+        if not isinstance(thought, str):
+            raise ToolExecutionError("think requires a string thought argument.")
+        return tool_think(thought)
+
+    @staticmethod
+    def _handle_summarize(arguments: dict[str, Any]) -> str:
+        path = arguments.get("path")
+        focus = arguments.get("focus")
+
+        if not isinstance(path, str) or not path:
+            raise ToolExecutionError("summarize requires a non-empty string path.")
+        if focus is not None and not isinstance(focus, str):
+            raise ToolExecutionError("summarize focus must be a string when provided.")
+
+        file_path = resolve_workspace_path(path)
+        if not file_path.is_file():
+            raise ToolExecutionError(f"File does not exist: {path}")
+
+        try:
+            contents = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ToolExecutionError(
+                f"Unable to decode {path} as UTF-8 text: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ToolExecutionError(f"Unable to read file: {exc}") from exc
+
+        max_chars = 20000
+        truncated = len(contents) > max_chars
+        contents_for_summary = contents[:max_chars]
+
+        summarize_messages: list[ChatCompletionMessageParam] = [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize source files. Provide a concise technical summary with "
+                    "purpose, key symbols, and notable behaviors. Mention important risks "
+                    "or oddities if present."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"File: {path}\n"
+                    f"Focus: {focus or 'General architecture and behavior'}\n"
+                    "If content appears truncated, state that in the summary.\n\n"
+                    f"```\n{contents_for_summary}\n```"
+                ),
+            },
+        ]
+
+        summary_response = client.chat.completions.create(
+            model="gpt-5.2",
+            messages=summarize_messages,
+        )
+
+        summary_text = summary_response.choices[0].message.content or ""
+        print_tool_line(Fore.MAGENTA, "summarize", "path", path)
+
+        return json.dumps(
+            {
+                "path": path,
+                "focus": focus,
+                "truncated": truncated,
+                "summary": summary_text,
+            }
+        )
+
+
+class CodingAgent(Agent):
+    def __init__(self, explorer: CodeExplorationAgent) -> None:
+        self.explorer = explorer
+
+        tools = cast(
+            list[ChatCompletionToolParam],
+            [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute a shell command and return its output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The shell command to execute.",
+                            }
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "think",
+                    "description": "Record a thought for the user to see before continuing.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thought": {
+                                "type": "string",
+                                "description": "The thought to display to the user.",
+                            }
+                        },
+                        "required": ["thought"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": "Apply a Linux patch-compatible diff to a file in the workspace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["update_file"],
+                                        "description": "The patch operation type.",
+                                    },
+                                    "diff": {
+                                        "type": "string",
+                                        "description": "A diff string that can be applied by the Linux patch command.",
+                                    },
+                                    "path": {
+                                        "type": "string",
+                                        "description": "The workspace-relative path to update.",
+                                    },
+                                },
+                                "required": ["type", "diff", "path"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["operation"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "explore",
+                    "description": "Delegate read-only code exploration to a dedicated subagent.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "What the subagent should investigate.",
+                            }
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ],
+        )
+
+        super().__init__(
+            name="coding_agent",
+            model="gpt-5.2",
+            system_prompt=(
+                "You are an expert coding agent that codes using the command line. "
+                "Use Linux commands that make sense. You have bash, think, apply_patch, "
+                "and an explore tool that calls a read-only code exploration subagent. "
+                "If you execute a tool, the results will be provided after it completes."
+                "\n"
+                "\n"
+                "When the user asks for information about a large codebase, call explore with"
+                " different prompts to investigate the codebase in a structured way."
+                " For example, you might start with 'explore: summarize the architecture of the codebase', then "
+                " follow up with 'explore: summarize the main loop in src/main.py' or 'explore: what does the tests/ directory contain?'"
+            ),
+            tools=tools,
+        )
+
+        self.register_tool_handler("bash", self._handle_bash)
+        self.register_tool_handler("think", self._handle_think)
+        self.register_tool_handler("apply_patch", self._handle_apply_patch)
+        self.register_tool_handler("explore", self._handle_explore)
+
+    @staticmethod
+    def _handle_bash(arguments: dict[str, Any]) -> str:
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            raise ToolExecutionError("bash requires a string command argument.")
+        return tool_bash(command)
+
+    @staticmethod
+    def _handle_think(arguments: dict[str, Any]) -> str:
+        thought = arguments.get("thought")
+        if not isinstance(thought, str):
+            raise ToolExecutionError("think requires a string thought argument.")
+        return tool_think(thought)
+
+    @staticmethod
+    def _handle_apply_patch(arguments: dict[str, Any]) -> str:
+        operation = arguments.get("operation")
+        if not isinstance(operation, dict):
+            raise ToolExecutionError("apply_patch requires an operation object.")
+        return tool_apply_patch(operation)
+
+    def _handle_explore(self, arguments: dict[str, Any]) -> str:
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str):
+            raise ToolExecutionError("explore requires a string prompt argument.")
+
+        print_tool_line(Fore.CYAN, "explore", "prompt", prompt)
+        exploration_reply = self.explorer.ask(prompt)
+        print_tool_line(Fore.GREEN, "explore", "result", exploration_reply)
+
+        return json.dumps({"prompt": prompt, "result": exploration_reply})
+
+
+def main() -> None:
+    explorer = CodeExplorationAgent()
+    coding_agent = CodingAgent(explorer=explorer)
+
+    print("Chat started. Type 'exit' or 'quit' to stop.")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in {"exit", "quit"}:
+            print("Goodbye!")
+            break
+
+        assistant_reply = coding_agent.ask(user_input)
+        print(f"Assistant: {assistant_reply}")
+
+
+if __name__ == "__main__":
+    main()
